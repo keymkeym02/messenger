@@ -1,0 +1,702 @@
+'use strict';
+/*
+ * IP Messenger - ISANG FILE LANG (server + page), walang kailangang i-install na package
+ *
+ *   node server.js
+ *
+ * Tapos sa PC 1 AT PC 2, buksan sa browser ang address na ipinapakita
+ * (halimbawa http://192.168.1.10:3000).
+ *
+ * Ang IP address ng bawat PC ang pagkakakilanlan niya. Kinukuha ito ng server
+ * mula sa mismong koneksyon kaya hindi ito mapepeke.
+ */
+
+const http = require('http');
+const os = require('os');
+
+const PORT = Number(process.env.PORT) || 3000;
+const MAX_HISTORY = 500;
+const MAX_TEXT = 2000;
+
+/* ---------- helpers ---------- */
+
+function lanAddresses() {
+  const out = [];
+  const nets = os.networkInterfaces();
+  for (const name of Object.keys(nets)) {
+    for (const n of nets[name] || []) {
+      if ((n.family === 'IPv4' || n.family === 4) && !n.internal) out.push(n.address);
+    }
+  }
+  return out;
+}
+
+const SERVER_IP = lanAddresses()[0] || '127.0.0.1';
+
+// Kapag "localhost" ang ginamit ng PC na may server, ipakita ang totoo niyang LAN IP.
+function clientIP(req) {
+  let ip = (req.socket && req.socket.remoteAddress) || 'unknown';
+  if (ip.startsWith('::ffff:')) ip = ip.slice(7);
+  if (ip === '::1' || ip === '127.0.0.1') ip = SERVER_IP;
+  return ip;
+}
+
+function readBody(req, limit) {
+  return new Promise((resolve, reject) => {
+    let size = 0;
+    const chunks = [];
+    req.on('data', (c) => {
+      size += c.length;
+      if (size > limit) return reject(new Error('too large'));
+      chunks.push(c);
+    });
+    req.on('end', () => resolve(Buffer.concat(chunks).toString('utf8')));
+    req.on('error', reject);
+  });
+}
+
+function sendJSON(res, status, obj) {
+  const body = JSON.stringify(obj);
+  res.writeHead(status, {
+    'Content-Type': 'application/json; charset=utf-8',
+    'Content-Length': Buffer.byteLength(body),
+    'Cache-Control': 'no-store'
+  });
+  res.end(body);
+}
+
+/* ---------- state ---------- */
+
+const clients = new Map(); // id -> { res, ip }
+const history = [];
+let nextClientId = 1;
+let nextMsgId = 1;
+
+function sse(res, event, data) {
+  try {
+    res.write('event: ' + event + '\ndata: ' + JSON.stringify(data) + '\n\n');
+  } catch (e) { /* nakasara na ang koneksyon */ }
+}
+
+function onlineIPs() {
+  return Array.from(new Set(Array.from(clients.values(), (c) => c.ip)));
+}
+
+function broadcastUsers() {
+  const ips = onlineIPs();
+  for (const c of clients.values()) sse(c.res, 'users', ips);
+}
+
+/* ---------- routes ---------- */
+
+function handleEvents(req, res) {
+  const ip = clientIP(req);
+  req.socket.setTimeout(0);
+  req.socket.setKeepAlive(true);
+
+  res.writeHead(200, {
+    'Content-Type': 'text/event-stream; charset=utf-8',
+    'Cache-Control': 'no-cache, no-transform',
+    Connection: 'keep-alive',
+    'X-Accel-Buffering': 'no'
+  });
+  res.write('retry: 2000\n\n');
+
+  const id = nextClientId++;
+  clients.set(id, { res, ip });
+
+  sse(res, 'hello', { ip });
+  // Sariling usapan lang ang ipinapadala (hindi makikita ng ibang IP ang usapan ng iba).
+  sse(res, 'history', history.filter((m) => m.from === ip || m.to === ip));
+  broadcastUsers();
+
+  const heartbeat = setInterval(() => {
+    try { res.write(': ping\n\n'); } catch (e) { /* ignore */ }
+  }, 15000);
+
+  req.on('close', () => {
+    clearInterval(heartbeat);
+    clients.delete(id);
+    broadcastUsers();
+  });
+}
+
+async function handleSend(req, res) {
+  const from = clientIP(req);
+
+  let data;
+  try {
+    data = JSON.parse(await readBody(req, 20000));
+  } catch (e) {
+    return sendJSON(res, 400, { error: 'Invalid request.' });
+  }
+
+  const text = typeof data.text === 'string' ? data.text.trim() : '';
+  const to = typeof data.to === 'string' ? data.to.trim() : '';
+
+  if (!text) return sendJSON(res, 400, { error: 'Message is empty.' });
+  if (text.length > MAX_TEXT) return sendJSON(res, 400, { error: 'Message is too long (max ' + MAX_TEXT + ' characters).' });
+  if (!to) return sendJSON(res, 400, { error: 'No recipient IP address.' });
+  if (to === from) return sendJSON(res, 400, { error: 'You cannot message your own IP address.' });
+  if (!onlineIPs().includes(to)) return sendJSON(res, 404, { error: to + ' is offline.' });
+
+  const msg = { id: nextMsgId++, from, to, text, time: new Date().toISOString() };
+  history.push(msg);
+  if (history.length > MAX_HISTORY) history.shift();
+
+  for (const c of clients.values()) {
+    if (c.ip === to || c.ip === from) sse(c.res, 'message', msg);
+  }
+  sendJSON(res, 200, { ok: true });
+}
+
+function handlePage(res) {
+  res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8', 'Cache-Control': 'no-cache' });
+  res.end(PAGE);
+}
+
+const server = http.createServer((req, res) => {
+  const pathname = new URL(req.url, 'http://localhost').pathname;
+
+  if (req.method === 'GET' && pathname === '/events') return handleEvents(req, res);
+  if (req.method === 'POST' && pathname === '/send') {
+    return handleSend(req, res).catch(() => sendJSON(res, 500, { error: 'Server error.' }));
+  }
+  if (req.method === 'GET' && (pathname === '/' || pathname === '/index.html')) return handlePage(res);
+  if (pathname === '/favicon.ico') { res.writeHead(204); return res.end(); }
+
+  res.writeHead(404, { 'Content-Type': 'text/plain; charset=utf-8' });
+  res.end('Not found');
+});
+
+server.on('error', (err) => {
+  if (err.code === 'EADDRINUSE') {
+    console.error('Port ' + PORT + ' is already in use. Close the other program, or use another port:\n  PORT=4000 node server.js');
+  } else {
+    console.error(err);
+  }
+  process.exit(1);
+});
+
+server.listen(PORT, '0.0.0.0', () => {
+  console.log('\n  IP Messenger is running.\n');
+  const addrs = lanAddresses();
+  if (addrs.length) {
+    addrs.forEach((a) => console.log('  Open this on BOTH PCs:  http://' + a + ':' + PORT));
+  } else {
+    console.log('  No network connection found. Connect to Wi-Fi or LAN first.');
+  }
+  console.log('\n  Press Ctrl+C to stop.\n');
+});
+
+
+/* =====================================================================
+ *  ANG PAGE (HTML + CSS + JavaScript ng browser)
+ *  Ito ang ipinapakita sa browser ng bawat PC.
+ * ===================================================================== */
+const PAGE = String.raw`<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>IP Messenger</title>
+<style>
+  :root {
+    --bg: #eef1f8;
+    --card: #ffffff;
+    --text: #1b2333;
+    --muted: #6a7488;
+    --line: #e3e8f1;
+    --brand: #4f46e5;
+    --brand-2: #7c3aed;
+    --soft: #eef0ff;
+    --bubble-in: #eceff6;
+    --ok: #16a34a;
+    --bad: #dc2626;
+    --bad-soft: #fdeceb;
+    --shadow: 0 12px 34px rgba(31, 41, 80, .10);
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --bg: #0d111f; --card: #171c2e; --text: #e8ecf7; --muted: #97a1b9;
+      --line: #262d45; --brand: #818cf8; --brand-2: #a78bfa; --soft: #232a4d;
+      --bubble-in: #232a42; --ok: #4ade80; --bad: #f87171; --bad-soft: #3a1c1c;
+      --shadow: 0 12px 34px rgba(0, 0, 0, .45);
+    }
+  }
+
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  [hidden] { display: none !important; }
+
+  body {
+    font-family: -apple-system, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+    background: var(--bg); color: var(--text);
+    height: 100vh; height: 100dvh;
+    display: flex; align-items: center; justify-content: center; padding: 16px;
+  }
+
+  .app {
+    width: 100%; max-width: 1040px; height: 100%; max-height: 820px;
+    display: grid; grid-template-columns: 330px 1fr;
+    background: var(--card); border: 1px solid var(--line);
+    border-radius: 18px; box-shadow: var(--shadow); overflow: hidden;
+  }
+
+  /* ---------- left: me + connect + chats ---------- */
+  .side { display: flex; flex-direction: column; min-height: 0; border-right: 1px solid var(--line); }
+
+  .me { padding: 18px 18px 14px; background: linear-gradient(135deg, var(--brand), var(--brand-2)); color: #fff; }
+  .me small { display: block; font-size: 12px; opacity: .85; }
+  .me strong { display: block; font-size: 22px; letter-spacing: .3px; margin: 2px 0 8px; }
+  .conn { display: flex; align-items: center; gap: 6px; font-size: 12px; opacity: .95; }
+
+  .dot { width: 9px; height: 9px; border-radius: 50%; background: #f59e0b; display: inline-block; flex-shrink: 0; }
+  .dot.on { background: var(--ok); }
+  .dot.off { background: var(--bad); }
+
+  .connect { display: flex; gap: 8px; padding: 14px 14px 6px; }
+  .connect input {
+    flex: 1; min-width: 0; padding: 10px 12px; font: inherit; font-size: 14px;
+    border: 1px solid var(--line); border-radius: 12px; background: var(--bg); color: var(--text); outline: none;
+  }
+  .connect input:focus { border-color: var(--brand); }
+
+  .btn {
+    border: none; border-radius: 12px; padding: 10px 14px; cursor: pointer;
+    font: inherit; font-size: 14px; font-weight: 600; color: #fff;
+    background: linear-gradient(135deg, var(--brand), var(--brand-2));
+  }
+  .btn:hover { filter: brightness(1.08); }
+  .btn:disabled { opacity: .45; cursor: not-allowed; filter: none; }
+
+  .err { margin: 6px 14px 0; padding: 8px 12px; border-radius: 10px; font-size: 13px; background: var(--bad-soft); color: var(--bad); }
+
+  .list-title { padding: 14px 18px 6px; font-size: 12px; font-weight: 700; text-transform: uppercase; letter-spacing: .06em; color: var(--muted); }
+  .list { list-style: none; overflow-y: auto; flex: 1; min-height: 0; }
+  .list-empty { padding: 8px 18px; font-size: 13px; color: var(--muted); }
+
+  .peer { display: flex; align-items: center; gap: 12px; padding: 11px 18px; cursor: pointer; border-left: 3px solid transparent; }
+  .peer:hover { background: var(--soft); }
+  .peer.active { background: var(--soft); border-left-color: var(--brand); }
+  .avatar {
+    position: relative; width: 44px; height: 44px; border-radius: 50%; flex-shrink: 0;
+    display: grid; place-items: center; color: #fff; font-weight: 700; font-size: 14px;
+    background: linear-gradient(135deg, var(--brand), var(--brand-2));
+  }
+  .peer.offline .avatar { background: #94a3b8; }
+  .avatar .dot { position: absolute; right: -1px; bottom: -1px; border: 2px solid var(--card); width: 13px; height: 13px; }
+  .peer-info { flex: 1; min-width: 0; }
+  .peer-ip { font-weight: 600; font-size: 15px; }
+  .peer-last { font-size: 13px; color: var(--muted); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  .badge { background: var(--bad); color: #fff; font-size: 11px; font-weight: 700; min-width: 20px; height: 20px; border-radius: 10px; padding: 0 6px; display: grid; place-items: center; }
+
+  /* ---------- right: conversation ---------- */
+  .main { display: flex; flex-direction: column; min-width: 0; min-height: 0; background: var(--bg); }
+
+  .empty { margin: auto; padding: 24px; text-align: center; color: var(--muted); max-width: 340px; }
+  .empty h2 { color: var(--text); font-size: 19px; margin-bottom: 8px; }
+  .empty p { font-size: 14px; }
+
+  .chat { display: flex; flex-direction: column; height: 100%; min-height: 0; }
+  .chat-head { display: flex; align-items: center; gap: 12px; padding: 12px 16px; background: var(--card); border-bottom: 1px solid var(--line); }
+  .back { display: none; border: none; background: none; color: var(--brand); font-size: 22px; cursor: pointer; padding: 0 4px; }
+  .title { font-weight: 700; }
+  .sub { font-size: 12px; color: var(--muted); }
+
+  .msgs { flex: 1; min-height: 0; overflow-y: auto; padding: 18px 16px; display: flex; flex-direction: column; gap: 6px; }
+  .none { margin: auto; font-size: 14px; color: var(--muted); }
+  .m { max-width: min(75%, 520px); display: flex; flex-direction: column; animation: pop .15s ease-out; }
+  .m.mine { align-self: flex-end; align-items: flex-end; }
+  .m.theirs { align-self: flex-start; align-items: flex-start; }
+  .bubble { padding: 9px 14px; border-radius: 18px; font-size: 15px; white-space: pre-wrap; overflow-wrap: anywhere; line-height: 1.4; }
+  .mine .bubble { background: linear-gradient(135deg, var(--brand), var(--brand-2)); color: #fff; border-bottom-right-radius: 5px; }
+  .theirs .bubble { background: var(--bubble-in); border-bottom-left-radius: 5px; }
+  .time { font-size: 11px; color: var(--muted); margin: 3px 6px 0; }
+  @keyframes pop { from { opacity: 0; transform: translateY(4px); } to { opacity: 1; transform: none; } }
+
+  .send-err { padding: 8px 16px; font-size: 13px; background: var(--bad-soft); color: var(--bad); }
+
+  .composer { display: flex; align-items: flex-end; gap: 10px; padding: 12px 14px; background: var(--card); border-top: 1px solid var(--line); }
+  .composer textarea {
+    flex: 1; resize: none; min-height: 44px; max-height: 140px; padding: 11px 14px;
+    font: inherit; font-size: 15px; border: 1px solid var(--line); border-radius: 22px;
+    background: var(--bg); color: var(--text); outline: none;
+  }
+  .composer textarea:focus { border-color: var(--brand); }
+  .composer textarea:disabled { opacity: .6; }
+  .send { width: 44px; height: 44px; padding: 0; border-radius: 50%; display: grid; place-items: center; flex-shrink: 0; }
+
+  /* ---------- phone ---------- */
+  @media (max-width: 760px) {
+    body { padding: 0; }
+    .app { grid-template-columns: 1fr; max-height: none; border-radius: 0; border: none; }
+    .main { display: none; }
+    .app.show-chat .side { display: none; }
+    .app.show-chat .main { display: flex; }
+    .back { display: block; }
+    .m { max-width: 88%; }
+  }
+</style>
+</head>
+<body>
+<div class="app" id="app">
+
+  <aside class="side">
+    <div class="me">
+      <small>Your IP address</small>
+      <strong id="meIp">…</strong>
+      <div class="conn"><i class="dot" id="connDot"></i><span id="connText">Connecting…</span></div>
+    </div>
+
+    <form class="connect" id="connectForm" autocomplete="off">
+      <input id="ipInput" placeholder="Connect to IP, e.g. 192.168.1.20" inputmode="decimal" spellcheck="false">
+      <button class="btn" type="submit">Connect</button>
+    </form>
+    <div class="err" id="connectErr" hidden></div>
+
+    <div class="list-title">Chats</div>
+    <ul class="list" id="list"></ul>
+  </aside>
+
+  <section class="main">
+    <div class="empty" id="empty">
+      <h2>Messenger by IP address</h2>
+      <p>Pick a PC from the list, or type its IP address and press Connect. The other PC must have this page open.</p>
+    </div>
+
+    <div class="chat" id="chat" hidden>
+      <header class="chat-head">
+        <button class="back" id="backBtn" type="button" aria-label="Back">←</button>
+        <div class="avatar" id="chatAvatar"></div>
+        <div>
+          <div class="title" id="chatTitle"></div>
+          <div class="sub" id="chatSub"></div>
+        </div>
+      </header>
+
+      <div class="msgs" id="msgs"></div>
+      <div class="send-err" id="sendErr" hidden></div>
+
+      <div class="composer">
+        <textarea id="input" rows="1" maxlength="2000"></textarea>
+        <button class="btn send" id="sendBtn" type="button" aria-label="Send">
+          <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><line x1="22" y1="2" x2="11" y2="13"/><polygon points="22 2 15 22 11 13 2 9 22 2"/></svg>
+        </button>
+      </div>
+    </div>
+  </section>
+
+</div>
+
+<script>
+(function () {
+  'use strict';
+
+  var $ = function (id) { return document.getElementById(id); };
+
+  var me = '';
+  var messages = [];
+  var online = [];
+  var current = null;          // IP ng kausap na bukas ngayon
+  var unread = {};             // ip -> bilang
+  var connected = false;       // nakakonekta sa server?
+  var sending = false;
+  var autoPicked = false;
+  var totalUnreadHidden = 0;
+  var baseTitle = document.title;
+  var timers = {};
+
+  /* ---------- helpers ---------- */
+  function other(m) { return m.from === me ? m.to : m.from; }
+  function isOnline(ip) { return online.indexOf(ip) !== -1; }
+
+  function isIPv4(s) {
+    var p = s.split('.');
+    if (p.length !== 4) return false;
+    for (var i = 0; i < 4; i++) {
+      if (!/^\d{1,3}$/.test(p[i]) || Number(p[i]) > 255) return false;
+    }
+    return true;
+  }
+
+  function fmtTime(iso) {
+    var d = new Date(iso);
+    return isNaN(d.getTime()) ? '' : d.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
+  }
+
+  function flash(el, text, ms) {
+    el.textContent = text;
+    el.hidden = false;
+    clearTimeout(timers[el.id]);
+    timers[el.id] = setTimeout(function () { el.hidden = true; }, ms || 5000);
+  }
+
+  function lastMessageWith(ip) {
+    for (var i = messages.length - 1; i >= 0; i--) {
+      if (other(messages[i]) === ip) return messages[i];
+    }
+    return null;
+  }
+
+  function avatarText(ip) { return ip.split('.').pop(); }
+
+  /* ---------- rendering ---------- */
+  function peerList() {
+    var ips = [];
+    online.forEach(function (ip) { if (ip !== me) ips.push(ip); });
+    messages.forEach(function (m) {
+      var o = other(m);
+      if (o !== me && ips.indexOf(o) === -1) ips.push(o);
+    });
+    if (current && ips.indexOf(current) === -1) ips.push(current);
+
+    function rank(ip) { var m = lastMessageWith(ip); return m ? m.id : 0; }
+    ips.sort(function (a, b) {
+      return (rank(b) - rank(a)) || ((isOnline(b) ? 1 : 0) - (isOnline(a) ? 1 : 0)) || (a < b ? -1 : 1);
+    });
+    return ips;
+  }
+
+  function renderList() {
+    var list = $('list');
+    list.innerHTML = '';
+    var ips = peerList();
+
+    if (!ips.length) {
+      var li = document.createElement('li');
+      li.className = 'list-empty';
+      li.textContent = 'No other PC yet. Open this page on the other PC.';
+      list.appendChild(li);
+      return;
+    }
+
+    ips.forEach(function (ip) {
+      var on = isOnline(ip);
+      var item = document.createElement('li');
+      item.className = 'peer' + (ip === current ? ' active' : '') + (on ? '' : ' offline');
+      item.addEventListener('click', function () { openChat(ip); });
+
+      var av = document.createElement('div');
+      av.className = 'avatar';
+      av.textContent = avatarText(ip);
+      var dot = document.createElement('i');
+      dot.className = 'dot' + (on ? ' on' : ' off');
+      av.appendChild(dot);
+
+      var info = document.createElement('div');
+      info.className = 'peer-info';
+      var name = document.createElement('div');
+      name.className = 'peer-ip';
+      name.textContent = ip;
+      var last = document.createElement('div');
+      last.className = 'peer-last';
+      var lm = lastMessageWith(ip);
+      last.textContent = lm ? (lm.from === me ? 'You: ' : '') + lm.text : (on ? 'Online' : 'Offline');
+      info.appendChild(name);
+      info.appendChild(last);
+
+      item.appendChild(av);
+      item.appendChild(info);
+
+      if (unread[ip]) {
+        var b = document.createElement('div');
+        b.className = 'badge';
+        b.textContent = unread[ip] > 99 ? '99+' : String(unread[ip]);
+        item.appendChild(b);
+      }
+      list.appendChild(item);
+    });
+  }
+
+  function renderHeader() {
+    if (!current) return;
+    $('chatAvatar').textContent = avatarText(current);
+    $('chatTitle').textContent = current;
+    $('chatSub').textContent = isOnline(current) ? 'Online' : 'Offline';
+    updateComposer();
+  }
+
+  function renderMessages() {
+    var box = $('msgs');
+    box.innerHTML = '';
+    var shown = messages.filter(function (m) { return other(m) === current; });
+
+    if (!shown.length) {
+      var n = document.createElement('div');
+      n.className = 'none';
+      n.textContent = 'No messages yet. Say hello!';
+      box.appendChild(n);
+      return;
+    }
+
+    shown.forEach(function (m) {
+      var wrap = document.createElement('div');
+      wrap.className = 'm ' + (m.from === me ? 'mine' : 'theirs');
+      var bubble = document.createElement('div');
+      bubble.className = 'bubble';
+      bubble.textContent = m.text;                 // textContent = ligtas sa HTML injection
+      var time = document.createElement('div');
+      time.className = 'time';
+      time.textContent = fmtTime(m.time);
+      wrap.appendChild(bubble);
+      wrap.appendChild(time);
+      box.appendChild(wrap);
+    });
+    box.scrollTop = box.scrollHeight;
+  }
+
+  function updateComposer() {
+    var canType = connected && !!current && isOnline(current);
+    $('input').disabled = !canType;
+    $('sendBtn').disabled = !canType || sending;
+    $('input').placeholder = !connected ? 'Reconnecting to the server…'
+      : (current && !isOnline(current)) ? current + ' is offline'
+      : 'Type a message (Enter = send, Shift+Enter = new line)';
+  }
+
+  function setConnection(on) {
+    connected = on;
+    $('connDot').className = 'dot ' + (on ? 'on' : 'off');
+    $('connText').textContent = on ? 'Connected' : 'Disconnected, retrying…';
+    updateComposer();
+  }
+
+  function openChat(ip) {
+    current = ip;
+    unread[ip] = 0;
+    $('empty').hidden = true;
+    $('chat').hidden = false;
+    $('app').classList.add('show-chat');
+    renderList();
+    renderHeader();
+    renderMessages();
+    if (!$('input').disabled) $('input').focus();
+  }
+
+  function closeChat() {
+    current = null;
+    $('chat').hidden = true;
+    $('empty').hidden = false;
+    $('app').classList.remove('show-chat');
+    renderList();
+  }
+
+  /* ---------- server ---------- */
+  var source = new EventSource('/events');
+
+  source.onopen = function () { setConnection(true); };
+  source.onerror = function () { setConnection(false); };
+
+  source.addEventListener('hello', function (e) {
+    me = JSON.parse(e.data).ip;
+    $('meIp').textContent = me;
+  });
+
+  source.addEventListener('history', function (e) {
+    messages = JSON.parse(e.data);
+    renderList();
+    if (current) renderMessages();
+  });
+
+  source.addEventListener('users', function (e) {
+    online = JSON.parse(e.data);
+    // Kung isa lang ang ibang PC na online, buksan agad ang usapan (isang beses lang).
+    if (!autoPicked && !current) {
+      var others = online.filter(function (ip) { return ip !== me; });
+      if (others.length === 1) { autoPicked = true; openChat(others[0]); return; }
+    }
+    renderList();
+    renderHeader();
+  });
+
+  source.addEventListener('message', function (e) {
+    var m = JSON.parse(e.data);
+    messages.push(m);
+    var ip = other(m);
+
+    if (ip === current) {
+      renderMessages();
+    } else if (m.from !== me) {
+      unread[ip] = (unread[ip] || 0) + 1;
+    }
+    if (document.hidden && m.from !== me) {
+      totalUnreadHidden++;
+      document.title = '(' + totalUnreadHidden + ') ' + baseTitle;
+    }
+    renderList();
+  });
+
+  document.addEventListener('visibilitychange', function () {
+    if (!document.hidden) {
+      totalUnreadHidden = 0;
+      document.title = baseTitle;
+    }
+  });
+
+  /* ---------- connect by IP ---------- */
+  $('connectForm').addEventListener('submit', function (e) {
+    e.preventDefault();
+    var box = $('connectErr');
+    var ip = $('ipInput').value.trim();
+
+    if (!isIPv4(ip)) return flash(box, 'Enter a valid IP address, for example 192.168.1.20.');
+    if (ip === me) return flash(box, 'That is your own IP address.');
+    if (!isOnline(ip)) return flash(box, 'No PC is connected at ' + ip + '. Open this page on that PC first.');
+
+    box.hidden = true;
+    $('ipInput').value = '';
+    openChat(ip);
+  });
+
+  /* ---------- sending ---------- */
+  function send() {
+    var text = $('input').value.trim();
+    if (!text || !current || !connected) return;
+
+    sending = true;
+    updateComposer();
+
+    fetch('/send', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ to: current, text: text })
+    })
+      .then(function (res) {
+        return res.json().catch(function () { return {}; }).then(function (data) {
+          if (!res.ok) throw new Error(data.error || ('Error ' + res.status));
+          $('input').value = '';
+          grow();
+        });
+      })
+      .catch(function (err) {
+        flash($('sendErr'), err.message === 'Failed to fetch' ? 'Cannot reach the server.' : err.message);
+      })
+      .then(function () {
+        sending = false;
+        updateComposer();
+        if (!$('input').disabled) $('input').focus();
+      });
+  }
+
+  function grow() {
+    var el = $('input');
+    el.style.height = 'auto';
+    el.style.height = Math.min(el.scrollHeight, 140) + 'px';
+  }
+
+  $('sendBtn').addEventListener('click', send);
+  $('input').addEventListener('input', grow);
+  $('input').addEventListener('keydown', function (e) {
+    if (e.key === 'Enter' && !e.shiftKey && !e.isComposing) {
+      e.preventDefault();
+      send();
+    }
+  });
+  $('backBtn').addEventListener('click', closeChat);
+
+  updateComposer();
+})();
+</script>
+</body>
+</html>
+`;
